@@ -4,20 +4,20 @@ from torch.utils.data import Dataset, DataLoader, random_split
 import numpy as np
 import os
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
 import torch.optim as optim
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f'{device=}')
 
-class StockChartDataset(Dataset):
-    def __init__(self, root_dir, transform=None, scaler=None, fit_scaler=False):
+class ChartDataset(Dataset):
+    def __init__(self, root_dir, num_features, transform=None, scaler=None, fit_scaler=False):
         self.root_dir = root_dir
         self.transform = transform
         self.classes = sorted(os.listdir(root_dir))
         self.filepaths = []
         self.labels = []
         self.scaler = scaler
+        self.num_features = num_features
 
         for class_idx, class_name in enumerate(self.classes):
             class_dir = os.path.join(self.root_dir, class_name)
@@ -32,8 +32,8 @@ class StockChartDataset(Dataset):
                 all_data = []
                 for filepath in self.filepaths:
                     chart_data = np.load(filepath)
-                    all_data.append(chart_data)
-                all_data_np = np.concatenate(all_data).reshape(-1, 1)
+                    all_data.append(chart_data.T)  # transposed to (100, 2)
+                all_data_np = np.concatenate(all_data).reshape(-1, self.num_features)
                 self.scaler.fit(all_data_np)
 
 
@@ -47,9 +47,9 @@ class StockChartDataset(Dataset):
         chart_data = np.load(filepath)
 
         # normalize
-        chart_data_scaled = self.scaler.transform(chart_data.reshape(-1, 1)).flatten()
-        # chart data shape (1, 100)
-        chart_data = torch.tensor(chart_data_scaled, dtype=torch.float32).unsqueeze(0)
+        chart_data_scaled = self.scaler.transform(chart_data.T.reshape(-1, self.num_features)).reshape(chart_data.T.shape).T
+        # chart data shape (2, 100)
+        chart_data = torch.tensor(chart_data_scaled, dtype=torch.float32)
 
         if self.transform:
             chart_data = self.transform(chart_data)
@@ -74,9 +74,9 @@ class PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-class StockChartTransformer(nn.Module):
+class ChartTransformer(nn.Module):
     def __init__(self, input_dim, d_model, nhead, num_layers, dim_feedforward, output_dim, dropout=0.1):
-        super(StockChartTransformer, self).__init__()
+        super(ChartTransformer, self).__init__()
 
         self.embedding = nn.Linear(input_dim, d_model) # input embedding
         self.pos_encoder = PositionalEncoding(d_model, dropout)
@@ -93,7 +93,7 @@ class StockChartTransformer(nn.Module):
         return self.fc(output)                  # (N, output_dim)
 
 
-input_dim = 1  # currently input number is a single feature
+input_dim = 2  # number of features
 sequence_length = 100  # Length of each input sequence
 d_model = 64  # Reduced d_model
 nhead = 4  # Reduced nhead, should divide d_model
@@ -103,9 +103,9 @@ output_dim = 2  # Binary classification
 dropout = 0.1
 batch_size = 64  # Increased batch size
 learning_rate = 1e-4  # Increased learning rate
-num_epochs = 50  # Increased epochs
+num_epochs = 20  # Increased epochs
 
-full_dataset = StockChartDataset(root_dir='data', fit_scaler=True)
+full_dataset = ChartDataset(root_dir='data', num_features=input_dim, fit_scaler=True)
 
 train_size = int(0.8 * len(full_dataset))
 val_size = len(full_dataset) - train_size
@@ -114,7 +114,7 @@ train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True
 val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
 
-model = StockChartTransformer(input_dim, d_model, nhead, num_layers, dim_feedforward, output_dim, dropout).to(device)
+model = ChartTransformer(input_dim, d_model, nhead, num_layers, dim_feedforward, output_dim, dropout).to(device)
 criterion = nn.CrossEntropyLoss()
 optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
@@ -126,7 +126,7 @@ for epoch in range(num_epochs):
     total_samples_train = 0
 
     for batch_idx, (data, targets) in enumerate(train_dataloader):
-        data = data.to(device)  # shape (N, 1, 100) -> need (N, 100, 1)
+        data = data.to(device)  # shape (N, 2, 100) -> need (N, 100, 2)
         data = data.permute(0, 2, 1)  # Reshape to (batch_size, seq_len, input_dim) = (N, 100, 1)
         targets = targets.to(device)
 
@@ -174,10 +174,10 @@ def infer(chart_data_np, model, scaler, device, target_label = None):
     model.to(device)
 
     # Preprocess the input data
-    chart_data_scaled = scaler.transform(chart_data_np.reshape(-1, 1)).flatten()
-    chart_tensor = torch.tensor(chart_data_scaled, dtype=torch.float32).unsqueeze(0).unsqueeze(0).to(device) # (1, 1, 100) -> (batch_size, channel, seq_len)
+    chart_data_scaled = scaler.transform(chart_data_np.T.reshape(-1, 2)).reshape(chart_data_np.T.shape).T  # output shape is (2, 100)
+    chart_tensor = torch.tensor(chart_data_scaled, dtype=torch.float32).unsqueeze(0).to(device) # (1, 2, 100) -> (batch_size, channel, seq_len)
 
-    chart_tensor = chart_tensor.permute(0, 2, 1) # (1, 100, 1) -> (batch_size, seq_len, input_dim)
+    chart_tensor = chart_tensor.permute(0, 2, 1) # (1, 100, 2) -> (batch_size, seq_len, input_dim)
 
     with torch.no_grad():
         output = model(chart_tensor)
@@ -200,12 +200,14 @@ import random
 NUMBERS_PER_FILE = 100
 
 def generate(increment):
+    randoms = []
     numbers = []
     cur = random.uniform(0, 10)
     for _ in range(NUMBERS_PER_FILE):
+        randoms.append(random.uniform(-10, 10))  # note that this is not in the training set
         numbers.append(cur)
         cur += random.uniform(*increment)
-    return np.array(numbers)
+    return np.array((numbers, randoms))
 
 
 inference_scaler = full_dataset.scaler
