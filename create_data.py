@@ -20,5 +20,5 @@ def generate(out_dir, increment):
             cur += random.uniform(*increment)
         np.save(os.path.join(out_dir, f'{i}.npy'), np.array(numbers))
 
-generate(updir, (-1, 5))
-generate(downdir, (-5, 1))
+generate(updir, (-4, 5))
+generate(downdir, (-5, 4))
